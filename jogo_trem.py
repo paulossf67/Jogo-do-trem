@@ -84,6 +84,7 @@ OLD_RECORD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reco
 # Estrutura padrão do save — qualquer campo ausente é preenchido com estes valores
 DEFAULT_SAVE = {
     "version": 1,
+    "player_name": "",         # nome do jogador (vazio = ainda não registrado)
     "high_score": 0,           # maior pontuação de todos os tempos
     "best_wave": 0,            # maior onda alcançada (incluindo Endless)
     "preferred_difficulty": 2, # última dificuldade escolhida (1/2/3)
@@ -92,7 +93,62 @@ DEFAULT_SAVE = {
     "cars_destroyed": 0,       # total de vagões destruídos
     "total_score": 0,          # soma de todas as pontuações (estatística)
     "last_played": None,       # data/hora da última partida (ISO)
+    # Ranking local: lista de {name, score, wave, date} ordenada por score (máx. 10)
+    "leaderboard": [],
 }
+
+# Limites e regras do nome do jogador
+NAME_MIN_LEN = 1
+NAME_MAX_LEN = 16
+LEADERBOARD_SIZE = 10
+
+# Caracteres permitidos no nome:
+# - letras (a-z, A-Z) e acentos do português
+# - números (0-9)
+# - espaço, hífen e underscore
+_NAME_ACCENTS = "áàâãäéèêëíìîïóòôõöúùûüçÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇñÑ"
+_NAME_EXTRA = " -_"  # espaço, hífen, underscore
+NAME_ALLOWED_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789"
+    + _NAME_ACCENTS
+    + _NAME_EXTRA
+)
+
+
+def is_name_char_allowed(ch):
+    """Retorna True se o caractere pode fazer parte do nome do jogador."""
+    return ch in NAME_ALLOWED_CHARS
+
+
+def sanitize_player_name(name):
+    """
+    Limpa o nome: remove caracteres especiais proibidos,
+    colapsa espaços repetidos e corta no tamanho máximo.
+
+    Retorna (nome_limpo, ok) onde ok=False se o nome ficou inválido.
+    """
+    if name is None:
+        return "", False
+
+    # Mantém só caracteres permitidos
+    cleaned = "".join(ch for ch in name if is_name_char_allowed(ch))
+
+    # Colapsa espaços/hífens repetidos no meio
+    while "  " in cleaned:
+        cleaned = cleaned.replace("  ", " ")
+    while "--" in cleaned:
+        cleaned = cleaned.replace("--", "-")
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+
+    # Remove espaços/hífens no início e no fim
+    cleaned = cleaned.strip(" -_")
+    cleaned = cleaned[:NAME_MAX_LEN]
+
+    ok = len(cleaned) >= NAME_MIN_LEN
+    return cleaned, ok
 
 
 def _migrate_old_record():
@@ -148,6 +204,9 @@ class SaveManager:
 
     def __init__(self):
         self.data = load_save()
+        # Garante que leaderboard seja sempre uma lista
+        if not isinstance(self.data.get("leaderboard"), list):
+            self.data["leaderboard"] = []
 
     @property
     def high_score(self):
@@ -161,6 +220,29 @@ class SaveManager:
     def preferred_difficulty(self):
         return self.data.get("preferred_difficulty", 2)
 
+    @property
+    def player_name(self):
+        """Nome registrado do jogador (string vazia se ainda não definido)."""
+        return (self.data.get("player_name") or "").strip()
+
+    @property
+    def has_name(self):
+        """True se o jogador já registrou um nome válido."""
+        return len(self.player_name) >= NAME_MIN_LEN
+
+    def set_player_name(self, name):
+        """
+        Define e grava o nome do jogador.
+        Aplica validação de caracteres especiais e tamanho.
+        Retorna True se o nome for válido e foi salvo.
+        """
+        cleaned, ok = sanitize_player_name(name)
+        if not ok:
+            return False
+        self.data["player_name"] = cleaned
+        self.save()
+        return True
+
     def begin_game(self, difficulty):
         """Chamado ao iniciar uma partida: incrementa contador e salva preferência."""
         self.data["games_played"] = self.data.get("games_played", 0) + 1
@@ -171,7 +253,7 @@ class SaveManager:
     def end_game(self, score, wave, cars_destroyed, reached_endless):
         """
         Chamado ao terminar uma partida (vitória ou derrota).
-        Atualiza recordes e estatísticas se necessário.
+        Atualiza recordes, estatísticas e o ranking local.
         """
         self.data["total_score"] = self.data.get("total_score", 0) + score
         self.data["cars_destroyed"] = self.data.get("cars_destroyed", 0) + cars_destroyed
@@ -185,8 +267,27 @@ class SaveManager:
         if reached_endless:
             self.data["games_won"] = self.data.get("games_won", 0) + 1
 
+        # Insere no ranking se a pontuação for digna
+        self._update_leaderboard(score, wave)
+
         self.data["last_played"] = datetime.now().isoformat(timespec="seconds")
         self.save()
+
+    def _update_leaderboard(self, score, wave):
+        """Adiciona a partida ao ranking local (top N por pontuação)."""
+        if score <= 0:
+            return
+        entry = {
+            "name": self.player_name or "Anônimo",
+            "score": score,
+            "wave": wave,
+            "date": datetime.now().isoformat(timespec="seconds"),
+        }
+        board = list(self.data.get("leaderboard") or [])
+        board.append(entry)
+        # Ordena por pontuação (maior primeiro), depois por onda
+        board.sort(key=lambda e: (e.get("score", 0), e.get("wave", 0)), reverse=True)
+        self.data["leaderboard"] = board[:LEADERBOARD_SIZE]
 
     def save(self):
         """Persiste o estado atual em save.json."""
@@ -317,6 +418,257 @@ def car_sprite(kind, flash):
 
 
 # ===========================================================================
+# Quadtree — partição espacial para colisões
+# ===========================================================================
+
+class Quadtree:
+    """
+    Quadtree 2D para reduzir testes de colisão.
+
+    Cada nó cobre um retângulo (x, y, w, h). Quando o número de objetos
+    passa de MAX_OBJECTS, o nó se divide em 4 subquadrantes — desde que
+    a profundidade atual seja menor que MAX_DEPTH (poda por profundidade).
+
+    Poda por profundidade máxima:
+      - Nenhum nó é criado além de MAX_DEPTH.
+      - Em MAX_DEPTH, objetos extras ficam no próprio nó (folha saturada).
+      - prune() remove ramos vazios após inserções/remoções.
+      - MIN_NODE_SIZE evita subdividir quadrantes menores que esse tamanho.
+
+    Uso típico a cada frame:
+        qt = Quadtree(0, 0, 0, W, H)
+        for obj in objects:
+            qt.insert(obj)          # obj precisa de .get_bounds() → (x, y, w, h)
+        candidates = qt.query_point(px, py, radius)
+    """
+
+    MAX_OBJECTS = 4     # quantos objetos cabem num nó antes de tentar subdividir
+    MAX_DEPTH = 6       # profundidade máxima (raiz = 0) — poda de subdivisão
+    MIN_NODE_SIZE = 16  # lado mínimo do quadrante em pixels (segunda poda espacial)
+
+    def __init__(self, depth, x, y, w, h, max_depth=None, min_node_size=None):
+        self.depth = depth
+        self.x, self.y, self.w, self.h = x, y, w, h
+        # Limites herdados da raiz (ou padrão da classe)
+        self.max_depth = self.MAX_DEPTH if max_depth is None else max_depth
+        self.min_node_size = self.MIN_NODE_SIZE if min_node_size is None else min_node_size
+        self.objects = []       # lista de objetos neste nó
+        self.nodes = []         # 4 filhos (NE, NW, SW, SE) ou vazio se folha
+
+    # ------------------------------------------------------------------ poda
+    def _can_split(self):
+        """
+        True se este nó ainda pode ser subdividido.
+        Poda por:
+          1) profundidade máxima (depth >= max_depth)
+          2) tamanho mínimo do quadrante (w ou h < min_node_size)
+        """
+        if self.depth >= self.max_depth:
+            return False
+        if self.w < self.min_node_size or self.h < self.min_node_size:
+            return False
+        return True
+
+    @property
+    def is_leaf(self):
+        """True se o nó não tem filhos."""
+        return not self.nodes
+
+    @property
+    def is_at_max_depth(self):
+        """True se este nó está na profundidade máxima permitida."""
+        return self.depth >= self.max_depth
+
+    def clear(self):
+        """Remove todos os objetos e filhos (permite reutilizar a árvore)."""
+        self.objects.clear()
+        for n in self.nodes:
+            n.clear()
+        self.nodes.clear()
+
+    def prune(self):
+        """
+        Poda recursiva: remove filhos vazios e colapsa nós cujos 4 filhos
+        estão vazios (viram folha de novo).
+
+        Chamar após batch de inserções se a árvore for reutilizada entre frames.
+        Retorna True se ESTE nó ficou totalmente vazio (sem objetos nem filhos).
+        """
+        if self.nodes:
+            # Poda filhos primeiro
+            for node in self.nodes:
+                node.prune()
+
+            # Se todos os filhos estão vazios, remove a subdivisão
+            if all(n.is_leaf and not n.objects for n in self.nodes):
+                self.nodes.clear()
+
+        # Nó vazio = sem objetos e sem filhos
+        return self.is_leaf and not self.objects
+
+    def _split(self):
+        """
+        Divide este nó em 4 subquadrantes.
+        Não faz nada se a poda por profundidade/tamanho impedir (_can_split).
+        """
+        if not self._can_split():
+            return False
+        if self.nodes:
+            return False  # já dividido
+
+        hw, hh = self.w / 2, self.h / 2
+        x, y = self.x, self.y
+        d = self.depth + 1
+        md, mn = self.max_depth, self.min_node_size
+        # Ordem: 0=NE, 1=NW, 2=SW, 3=SE
+        self.nodes = [
+            Quadtree(d, x + hw, y,      hw, hh, md, mn),  # NE
+            Quadtree(d, x,      y,      hw, hh, md, mn),  # NW
+            Quadtree(d, x,      y + hh, hw, hh, md, mn),  # SW
+            Quadtree(d, x + hw, y + hh, hw, hh, md, mn),  # SE
+        ]
+        return True
+
+    def _index(self, bounds):
+        """
+        Retorna o índice do subquadrante que contém bounds por completo,
+        ou -1 se o objeto cruza a linha do meio (fica no nó pai).
+        bounds = (bx, by, bw, bh)
+        """
+        if not self.nodes:
+            return -1
+        bx, by, bw, bh = bounds
+        mid_x = self.x + self.w / 2
+        mid_y = self.y + self.h / 2
+
+        top = by + bh <= mid_y
+        bottom = by >= mid_y
+        left = bx + bw <= mid_x
+        right = bx >= mid_x
+
+        if top and right:
+            return 0
+        if top and left:
+            return 1
+        if bottom and left:
+            return 2
+        if bottom and right:
+            return 3
+        return -1   # cruza fronteira
+
+    def insert(self, obj):
+        """
+        Insere um objeto que implementa get_bounds() → (x, y, w, h).
+
+        Se o nó está na profundidade máxima, o objeto permanece aqui
+        mesmo que MAX_OBJECTS seja ultrapassado (folha saturada).
+        """
+        bounds = obj.get_bounds()
+
+        # Se já está dividido, tenta colocar no filho certo
+        if self.nodes:
+            idx = self._index(bounds)
+            if idx != -1:
+                self.nodes[idx].insert(obj)
+                return
+
+        self.objects.append(obj)
+
+        # Tenta subdividir só se ainda não é folha na profundidade máxima
+        if (len(self.objects) > self.MAX_OBJECTS
+                and self._can_split()
+                and not self.nodes):
+            if self._split():
+                # Redistribui objetos para os filhos
+                remaining = []
+                for o in self.objects:
+                    idx = self._index(o.get_bounds())
+                    if idx != -1:
+                        self.nodes[idx].insert(o)
+                    else:
+                        remaining.append(o)
+                self.objects = remaining
+
+    def query_point(self, px, py, radius=8):
+        """
+        Retorna candidatos cuja AABB intersecta o círculo/quadrado
+        centrado em (px, py) com 'radius' de margem.
+        """
+        qx, qy = px - radius, py - radius
+        qw, qh = radius * 2, radius * 2
+        return self.query_rect(qx, qy, qw, qh)
+
+    def query_rect(self, qx, qy, qw, qh):
+        """Retorna todos os objetos cujas bounds intersectam o retângulo."""
+        result = []
+        if not self._intersects(qx, qy, qw, qh):
+            return result
+
+        for obj in self.objects:
+            bx, by, bw, bh = obj.get_bounds()
+            if self._rects_overlap(qx, qy, qw, qh, bx, by, bw, bh):
+                result.append(obj)
+
+        for node in self.nodes:
+            result.extend(node.query_rect(qx, qy, qw, qh))
+        return result
+
+    def query_circle(self, cx, cy, radius):
+        """Candidatos cuja AABB intersecta o círculo (cx, cy, radius)."""
+        candidates = self.query_point(cx, cy, radius)
+        r2 = radius * radius
+        out = []
+        for obj in candidates:
+            bx, by, bw, bh = obj.get_bounds()
+            # Ponto mais próximo da AABB ao centro do círculo
+            nx = max(bx, min(cx, bx + bw))
+            ny = max(by, min(cy, by + bh))
+            dx, dy = cx - nx, cy - ny
+            if dx * dx + dy * dy <= r2:
+                out.append(obj)
+        return out
+
+    def _intersects(self, qx, qy, qw, qh):
+        """True se o retângulo de consulta intersecta este nó."""
+        return self._rects_overlap(qx, qy, qw, qh, self.x, self.y, self.w, self.h)
+
+    @staticmethod
+    def _rects_overlap(ax, ay, aw, ah, bx, by, bw, bh):
+        return ax < bx + bw and ax + aw > bx and ay < by + bh and ay + ah > by
+
+    def count_nodes(self):
+        """Total de nós na árvore (inclui a raiz)."""
+        return 1 + sum(n.count_nodes() for n in self.nodes)
+
+    def max_depth_reached(self):
+        """Maior profundidade efetivamente usada na árvore."""
+        if not self.nodes:
+            return self.depth
+        return max(n.max_depth_reached() for n in self.nodes)
+
+    def stats(self):
+        """
+        Estatísticas para debug:
+        {nodes, leaves, objects, max_depth, at_max_depth_leaves}
+        """
+        info = {
+            "nodes": 1,
+            "leaves": 1 if self.is_leaf else 0,
+            "objects": len(self.objects),
+            "max_depth": self.depth,
+            "at_max_depth_leaves": 1 if (self.is_leaf and self.is_at_max_depth) else 0,
+        }
+        for n in self.nodes:
+            s = n.stats()
+            info["nodes"] += s["nodes"]
+            info["leaves"] += s["leaves"]
+            info["objects"] += s["objects"]
+            info["max_depth"] = max(info["max_depth"], s["max_depth"])
+            info["at_max_depth_leaves"] += s["at_max_depth_leaves"]
+        return info
+
+
+# ===========================================================================
 # Classes de entidades
 # ===========================================================================
 
@@ -333,6 +685,8 @@ class Car:
         self.speed_bonus = speed_bonus             # multiplicador extra de velocidade (ex.: rápido)
         # Cooldown de tiro só para o tipo "atirador"
         self.shoot_cd = random.uniform(1.5, 3.0) if kind == "atirador" else 0.0
+        # Cache de bounds para a quadtree (atualizado em refresh_bounds)
+        self._bounds = (0.0, 0.0, 0.0, 0.0)
 
     def _center(self):
         """Retorna (x, y, ângulo) do centro do vagão na pista."""
@@ -348,6 +702,20 @@ class Car:
     def on_track(self):
         """True se o vagão já saiu do túnel de entrada e ainda não chegou ao de saída."""
         return self.s + self.w / 2 > 0 and self.s < TRACK_LEN
+
+    def refresh_bounds(self):
+        """
+        Atualiza a AABB axis-aligned usada pela quadtree.
+        Usa a diagonal do vagão como margem para cobrir a rotação.
+        """
+        cx, cy, _ = self._center()
+        # Raio seguro = metade da diagonal (cobre qualquer rotação)
+        half = 0.5 * math.hypot(self.w, self.h) + 6
+        self._bounds = (cx - half, cy - half, half * 2, half * 2)
+
+    def get_bounds(self):
+        """Retorna (x, y, w, h) para inserção na quadtree."""
+        return self._bounds
 
     def hit_test(self, px, py, margin=4):
         """
@@ -517,10 +885,15 @@ class Game:
         self.med = pygame.font.SysFont("arial", 28, bold=True)
         self.small = pygame.font.SysFont("arial", 16)
 
-        # Sistema de save (recorde, estatísticas, preferências)
+        # Sistema de save (recorde, estatísticas, preferências, nome)
         self.save_mgr = SaveManager()
         self.record = self.save_mgr.high_score
         self.difficulty = self.save_mgr.preferred_difficulty  # restaura última dificuldade
+
+        # Entrada de nome do jogador
+        self.name_input = self.save_mgr.player_name  # texto sendo digitado
+        self.name_cursor_t = 0.0                     # timer do cursor piscante
+        self.name_error = ""                         # mensagem de erro (nome inválido)
 
         # Efeitos sonoros gerados proceduralmente
         self.sfx = {}
@@ -538,9 +911,64 @@ class Game:
             pass   # se o mixer falhar, o jogo continua sem som
 
         self.reset(from_menu=False)   # prepara estado interno, mas não conta como partida
-        self.state = "menu"            # estados: menu | banner | playing | paused | lost | won
+        # Se ainda não tem nome, começa na tela de registro; senão, no menu
+        self.state = "name_entry" if not self.save_mgr.has_name else "menu"
         self.flash_t = 0.0            # tempo restante de flash branco na tela
         self.float_texts = []
+
+    def start_name_entry(self):
+        """Abre a tela de registro/edição do nome (a partir do menu)."""
+        self.name_input = self.save_mgr.player_name
+        self.name_error = ""
+        self.name_cursor_t = 0.0
+        self.state = "name_entry"
+        pygame.key.start_text_input()   # habilita TEXTINPUT (acentos, etc.)
+
+    def confirm_name(self):
+        """
+        Tenta salvar o nome digitado.
+        Se válido, vai para o menu; se inválido, mostra erro.
+        """
+        # Pré-valida para mensagem de erro mais clara
+        cleaned, ok = sanitize_player_name(self.name_input)
+        if not ok:
+            # Detecta se o problema é caractere especial ou nome vazio
+            has_special = any(ch and not is_name_char_allowed(ch) for ch in (self.name_input or ""))
+            if has_special and not cleaned:
+                self.name_error = "Só letras, números, espaço, - e _"
+            else:
+                self.name_error = f"Digite um nome ({NAME_MIN_LEN}–{NAME_MAX_LEN} caracteres)"
+            self.play("lose")
+            return
+
+        if self.save_mgr.set_player_name(self.name_input):
+            self.name_input = cleaned  # reflete o nome limpo na UI
+            self.name_error = ""
+            self.state = "menu"
+            pygame.key.stop_text_input()
+            self.play("power")
+        else:
+            self.name_error = f"Digite um nome ({NAME_MIN_LEN}–{NAME_MAX_LEN} caracteres)"
+            self.play("lose")
+
+    def handle_name_text(self, event):
+        """
+        Processa teclas especiais na tela de nome (Enter, Esc, Backspace).
+        Caracteres normais vêm pelo evento TEXTINPUT (suporta acentos).
+        """
+        if event.key == pygame.K_RETURN:
+            self.confirm_name()
+            return
+        if event.key == pygame.K_ESCAPE:
+            # Só permite cancelar se já existir um nome salvo
+            if self.save_mgr.has_name:
+                self.state = "menu"
+                pygame.key.stop_text_input()
+            return
+        if event.key == pygame.K_BACKSPACE:
+            self.name_input = self.name_input[:-1]
+            self.name_error = ""
+            return
 
     def play(self, name):
         """Toca um efeito sonoro pelo nome (ignora se não existir)."""
@@ -599,6 +1027,7 @@ class Game:
         self.float_texts = []
         self.endless = False             # True depois de completar as 5 ondas normais
         self.cars_destroyed_session = 0  # contador de vagões destruídos nesta partida
+        self._quadtree = None            # reconstruída a cada frame em update()
         self.next_wave()
 
     def next_wave(self):
@@ -760,12 +1189,24 @@ class Game:
         # Remove power-ups que chegaram até a torre sem serem coletados
         self.powerups = [p for p in self.powerups if math.hypot(p.x - CX, p.y - CY) > 34]
 
-        # --- colisão: tiros do jogador × vagões ---
+        # --- monta quadtree com vagões na pista (O(n log n) insert) ---
+        # Só inclui vagões visíveis/colidíveis para reduzir nós inúteis
+        qt = Quadtree(0, -40, -40, W + 80, H + 80)
+        for c in self.cars:
+            if c.on_track and c.hp > 0:
+                c.refresh_bounds()
+                qt.insert(c)
+        self._quadtree = qt   # guarda para debug / reuso na explosão de bomba
+
+        # --- colisão: tiros do jogador × vagões (via quadtree) ---
         for b in self.bullets:
             if not b.alive:
                 continue
-            for c in self.cars:
-                if c.on_track and c.hit_test(b.x, b.y):
+            # Consulta espacial: só candidatos próximos ao tiro
+            candidates = qt.query_point(b.x, b.y, radius=20)
+            hit = False
+            for c in candidates:
+                if c.hp > 0 and c.hit_test(b.x, b.y):
                     b.alive = False
                     c.hp -= b.damage
                     c.flash = 0.09
@@ -773,8 +1214,9 @@ class Game:
                     self.play("hit")
                     if c.hp <= 0:
                         self._destroy_car(c)
+                    hit = True
                     break
-            else:
+            if not hit:
                 # Se não acertou vagão, tenta acertar um power-up (coleta)
                 for pu in self.powerups[:]:
                     if b.rect.colliderect(pu.rect):
@@ -857,9 +1299,14 @@ class Game:
             self.flash_t = 0.18
         self.explode(cx, cy, c.color, big)
 
-        # Efeito em cadeia da bomba
+        # Efeito em cadeia da bomba — vizinhos via quadtree (raio 90 px)
         if c.kind == "bomba":
-            for other in self.cars:
+            qt = getattr(self, "_quadtree", None)
+            if qt is not None:
+                neighbors = qt.query_circle(cx, cy, 90)
+            else:
+                neighbors = self.cars
+            for other in neighbors:
                 if other is not c and other.hp > 0:
                     ox, oy = other.pos
                     if math.hypot(ox - cx, oy - cy) < 90:
@@ -940,7 +1387,9 @@ class Game:
             surf.blit(flash, (0, 0))
 
         # Overlays de estado
-        if self.state == "menu":
+        if self.state == "name_entry":
+            self.overlay_name_entry(surf)
+        elif self.state == "menu":
             self.overlay_menu(surf)
         elif self.state == "paused":
             self.overlay(surf, "PAUSADO", (255, 255, 255),
@@ -1017,8 +1466,9 @@ class Game:
         """Desenha a barra superior com pontuação, onda, vidas e power-ups ativos."""
         pygame.draw.rect(surf, (18, 22, 32), (0, 0, W, 36))
 
-        # Pontos e recorde
-        surf.blit(self.font.render(f"Pontos: {self.score}", True, (255, 255, 255)), (12, 7))
+        # Nome do jogador + pontos e recorde
+        pname = self.save_mgr.player_name or "Anônimo"
+        surf.blit(self.font.render(f"{pname}  |  Pontos: {self.score}", True, (255, 255, 255)), (12, 7))
         surf.blit(self.small.render(f"Recorde: {self.record}", True, (180, 180, 200)), (12, 22))
 
         # Número da onda
@@ -1059,23 +1509,58 @@ class Game:
         img = f.render(text, True, color)
         surf.blit(img, img.get_rect(center=(W // 2, H // 2 + dy)))
 
+    def overlay_name_entry(self, surf):
+        """Tela para registrar ou editar o nome do jogador."""
+        shade = pygame.Surface((W, H), pygame.SRCALPHA)
+        shade.fill((0, 0, 0, 190))
+        surf.blit(shade, (0, 0))
+
+        title = "QUAL É O SEU NOME?" if not self.save_mgr.has_name else "EDITAR NOME"
+        self.center_text(surf, title, (255, 220, 90), -120)
+        self.center_text(surf, f"Letras, números, espaço, - e _  |  máx. {NAME_MAX_LEN}",
+                         (180, 180, 180), -70, small=True)
+
+        # Caixa de texto
+        box_w, box_h = 360, 48
+        box_x, box_y = W // 2 - box_w // 2, H // 2 - 20
+        pygame.draw.rect(surf, (30, 35, 50), (box_x, box_y, box_w, box_h), border_radius=8)
+        pygame.draw.rect(surf, (100, 180, 255), (box_x, box_y, box_w, box_h), 2, border_radius=8)
+
+        # Texto digitado + cursor piscante
+        self.name_cursor_t = (self.name_cursor_t + 0.05) % 1.0
+        cursor = "|" if self.name_cursor_t < 0.5 else " "
+        display = self.name_input + cursor
+        txt = self.med.render(display, True, (255, 255, 255))
+        surf.blit(txt, txt.get_rect(center=(W // 2, box_y + box_h // 2)))
+
+        if self.name_error:
+            self.center_text(surf, self.name_error, (255, 100, 100), 50, small=True)
+
+        self.center_text(surf, "ENTER confirma  |  BACKSPACE apaga", (190, 190, 200), 100, small=True)
+        if self.save_mgr.has_name:
+            self.center_text(surf, "ESC cancela", (160, 160, 170), 130, small=True)
+        else:
+            self.center_text(surf, "O nome aparece no ranking e no placar", (160, 160, 170), 130, small=True)
+
     def overlay_menu(self, surf):
-        """Tela de menu inicial com seleção de dificuldade, estatísticas e instruções."""
+        """Tela de menu inicial com nome, dificuldade, estatísticas e ranking."""
         shade = pygame.Surface((W, H), pygame.SRCALPHA)
         shade.fill((0, 0, 0, 175))
         surf.blit(shade, (0, 0))
 
-        self.center_text(surf, "JOGO DO TREM", (255, 220, 90), -170)
+        self.center_text(surf, "JOGO DO TREM", (255, 220, 90), -190)
+        pname = self.save_mgr.player_name or "Anônimo"
+        self.center_text(surf, f"Jogador: {pname}   (N para alterar)", (180, 220, 255), -145, small=True)
         self.center_text(surf, "Destrua os vagões antes que atravessem o túnel!",
                          (230, 230, 230), -115, small=True)
 
-        # Lista de dificuldades (a selecionada fica destacada)
-        y0 = -55
+        # Lista de dificuldades
+        y0 = -70
         for d, info in DIFFICULTIES.items():
             selected = self.difficulty == d
             col = (120, 255, 140) if selected else (200, 200, 200)
             prefix = "▶ " if selected else "  "
-            self.center_text(surf, f"{prefix}{d} - {info['name']}", col, y0 + (d - 1) * 28, small=True)
+            self.center_text(surf, f"{prefix}{d} - {info['name']}", col, y0 + (d - 1) * 26, small=True)
 
         # Estatísticas do save
         sd = self.save_mgr.data
@@ -1084,36 +1569,44 @@ class Game:
             f"Partidas: {sd.get('games_played', 0)}   |   Endless: {sd.get('games_won', 0)}   |   Vagões: {sd.get('cars_destroyed', 0)}",
         ]
         for i, line in enumerate(stats_lines):
-            self.center_text(surf, line, (180, 210, 255), 45 + i * 24, small=True)
+            self.center_text(surf, line, (180, 210, 255), 25 + i * 22, small=True)
 
-        lines = [
-            "Mouse: mira  |  Clique: atira  |  P: pausa",
-            "Power-ups: R rapidez · P pesado · E escudo · M multitiros",
-            "Novos inimigos: Rápido · Bomba · Atirador",
-        ]
-        for i, line in enumerate(lines):
-            self.center_text(surf, line, (190, 190, 200), 110 + i * 24, small=True)
-        self.center_text(surf, "Clique ou pressione ENTER para começar",
-                         (100, 255, 130), 200, small=True)
+        # Mini ranking (top 5)
+        board = sd.get("leaderboard") or []
+        if board:
+            self.center_text(surf, "— Ranking local —", (255, 200, 100), 80, small=True)
+            for i, entry in enumerate(board[:5]):
+                line = f"{i + 1}. {entry.get('name', '?')}  —  {entry.get('score', 0)} pts  (onda {entry.get('wave', 0)})"
+                self.center_text(surf, line, (200, 200, 210), 105 + i * 20, small=True)
+        else:
+            lines = [
+                "Mouse: mira  |  Clique: atira  |  P: pausa",
+                "Power-ups: R rapidez · P pesado · E escudo · M multitiros",
+            ]
+            for i, line in enumerate(lines):
+                self.center_text(surf, line, (190, 190, 200), 90 + i * 22, small=True)
+
+        self.center_text(surf, "Clique ou ENTER para começar  |  N editar nome",
+                         (100, 255, 130), 220, small=True)
 
     def overlay(self, surf, title, color, hint="R joga de novo  |  ESC sai"):
         """Overlay genérico de fim de jogo ou pausa."""
         shade = pygame.Surface((W, H), pygame.SRCALPHA)
         shade.fill((0, 0, 0, 160))
         surf.blit(shade, (0, 0))
-        self.center_text(surf, title, color, -60)
+        self.center_text(surf, title, color, -70)
         if self.state != "paused":
-            self.center_text(surf, f"Pontuação: {self.score}  |  Recorde: {self.record}",
-                             (255, 255, 255), 5, small=True)
+            pname = self.save_mgr.player_name or "Anônimo"
+            self.center_text(surf, f"{pname}  —  Pontuação: {self.score}  |  Recorde: {self.record}",
+                             (255, 255, 255), -5, small=True)
             self.center_text(surf, f"Onda: {self.wave}  |  Vagões destruídos: {self.cars_destroyed_session}",
-                             (200, 200, 220), 35, small=True)
+                             (200, 200, 220), 25, small=True)
             if self.endless:
                 self.center_text(surf, f"Chegou à onda {self.wave} no Endless!",
-                                 (255, 200, 100), 65, small=True)
-            # Novo recorde?
+                                 (255, 200, 100), 55, small=True)
             if self.score >= self.record and self.score > 0:
-                self.center_text(surf, "NOVO RECORDE!", (255, 230, 80), 95, small=True)
-        self.center_text(surf, hint, (190, 190, 190), 130, small=True)
+                self.center_text(surf, "NOVO RECORDE!", (255, 230, 80), 85, small=True)
+        self.center_text(surf, hint, (190, 190, 190), 125, small=True)
 
 
 # ===========================================================================
@@ -1133,6 +1626,9 @@ def main():
     pygame.display.set_caption("Jogo do Trem — Melhorado")
     clock = pygame.time.Clock()
     game = Game()
+    # Se abriu na tela de nome, ativa entrada de texto (acentos)
+    if game.state == "name_entry":
+        pygame.key.start_text_input()
 
     while True:
         # Limita dt para evitar saltos grandes se o jogo travar
@@ -1140,15 +1636,41 @@ def main():
 
         # --- eventos de entrada ---
         for ev in pygame.event.get():
-            if ev.type == pygame.QUIT or (ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE):
+            if ev.type == pygame.QUIT:
                 pygame.quit()
                 sys.exit()
+
+            # Tela de registro de nome — trata teclas e texto separadamente
+            if game.state == "name_entry":
+                if ev.type == pygame.KEYDOWN:
+                    if ev.key == pygame.K_ESCAPE and not game.save_mgr.has_name:
+                        pass  # não deixa sair sem nome na primeira vez
+                    else:
+                        game.handle_name_text(ev)
+                elif ev.type == pygame.TEXTINPUT:
+                    # Aceita só caracteres permitidos (letras, acentos, números, espaço, - _)
+                    for ch in ev.text:
+                        if len(game.name_input) >= NAME_MAX_LEN:
+                            game.name_error = f"Máximo {NAME_MAX_LEN} caracteres"
+                            break
+                        if is_name_char_allowed(ch):
+                            game.name_input += ch
+                            game.name_error = ""
+                        else:
+                            # Bloqueia caractere especial na hora
+                            game.name_error = "Caractere não permitido"
+                continue
+
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                pygame.quit()
+                sys.exit()
+
             if ev.type == pygame.KEYDOWN:
-                if ev.key == pygame.K_r:
+                if ev.key == pygame.K_r and game.state != "menu":
                     game.reset()
                 if ev.key == pygame.K_p:
                     game.toggle_pause()
-                # Seleção de dificuldade só no menu
+                # Menu: dificuldade, nome e começar
                 if game.state == "menu":
                     if ev.key in (pygame.K_1, pygame.K_KP1):
                         game.difficulty = 1
@@ -1162,12 +1684,14 @@ def main():
                         game.difficulty = 3
                         game.save_mgr.data["preferred_difficulty"] = 3
                         game.save_mgr.save()
+                    elif ev.key == pygame.K_n:
+                        game.start_name_entry()
                     elif ev.key in (pygame.K_RETURN, pygame.K_SPACE):
                         game.reset()
             if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 if game.state == "menu":
                     game.reset()
-                else:
+                elif game.state == "playing":
                     game.shoot()
 
         mouse = pygame.mouse.get_pos()
