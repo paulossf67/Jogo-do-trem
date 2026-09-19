@@ -1,11 +1,11 @@
 {
   "version": 1,
-  "high_score": 30970,
-  "best_wave": 12,
+  "high_score": 3240,
+  "best_wave": 0,
   "preferred_difficulty": 2,
-  "games_played": 1,
-  "games_won": 1,
-  "cars_destroyed": 201,
-  "total_score": 30970,
-  "last_played": "2026-09-19T19:01:18"
+  "games_played": 0,
+  "games_won": 0,
+  "cars_destroyed": 0,
+  "total_score": 0,
+  "last_played": null
 }
