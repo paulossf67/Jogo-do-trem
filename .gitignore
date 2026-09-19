@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 .venv/
 *.log
+
+# Dados do jogador (nome, ranking, estatísticas) — gerados ao jogar
+save.json
+save.json.tmp
+recorde.txt

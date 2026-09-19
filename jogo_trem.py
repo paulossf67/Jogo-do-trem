@@ -5,11 +5,13 @@ Controles:
   Mouse .......... mira a torre
   Clique / segurar atira
   P .............. pausa
+  M .............. volta ao menu (na pausa ou no fim da partida)
   R .............. reinicia
   1/2/3 .......... escolha de dificuldade no menu
   ESC ............ sai
 """
 import array
+import bisect
 import json
 import math
 import os
@@ -27,10 +29,11 @@ CX, CY = W // 2, 34 + (H - 34) // 2       # centro da tela (posição da torre)
 TRACK_R = 200                             # raio da pista circular (em pixels)
 IN_ANG = math.radians(-50)                # ângulo do túnel de entrada (sentido horário)
 OUT_ANG = math.radians(230)               # ângulo do túnel de saída
-TRACK_LEN = TRACK_R * (OUT_ANG - IN_ANG)  # comprimento total da pista visível
 TUNNEL_LEN = 140                          # comprimento visual de cada túnel
 TOTAL_WAVES = 5                           # ondas normais antes do modo Endless
 START_LIVES = 3                           # vidas padrão (pode mudar pela dificuldade)
+MAX_LIVES = 5                             # máximo de vidas (chefes derrubados dão +1)
+BOSS_EVERY = 5                            # um chefe a cada N ondas (mais chefes nas ondas seguintes)
 
 # ---------------------------------------------------------------------------
 # Constantes de combate e power-ups
@@ -42,6 +45,8 @@ HEAVY_TIME = 5.5           # duração do power-up "pesado" (tiro com mais dano)
 POWERUP_CHANCE = 0.28      # chance base de dropar power-up ao destruir vagão
 POWERUP_SPEED = 70         # velocidade com que o power-up voa até a torre (px/s)
 COMBO_WINDOW = 2.2         # tempo máximo entre destruições para manter o combo
+WEAPON_TIME = 8.0          # duração das armas perfurante e míssil
+BLAST_R = 85               # raio da explosão do míssil (px)
 
 # tipo: (vida, pontos, largura, altura, cor RGB, nome exibido)
 CAR_TYPES = {
@@ -50,7 +55,7 @@ CAR_TYPES = {
     "tanque": (2, 15, 70, 44, (215, 175, 40), "Tanque"),
     "blindado": (3, 25, 70, 44, (130, 135, 145), "Blindado"),
     "passageiro": (1, 10, 70, 44, (60, 130, 210), "Passageiro"),
-    "rapido": (1, 20, 58, 36, (40, 200, 180), "Rápido"),      # mais veloz
+    "rapido": (1, 20, 58, 36, (40, 200, 180), "Rápido"),      # compacto: alvo menor, mais pontos
     "bomba": (2, 30, 64, 48, (180, 50, 20), "Bomba"),         # explode e danifica vizinhos
     "atirador": (2, 35, 68, 44, (160, 60, 200), "Atirador"),  # atira de volta na torre
     "chefe": (18, 400, 140, 68, (90, 30, 120), "Chefe"),       # boss da onda
@@ -63,7 +68,12 @@ POWERUPS = {
     "pesado": ((230, 60, 60), "P"),        # tiros causam 2 de dano
     "escudo": ((60, 200, 90), "E"),        # bloqueia uma vida perdida
     "multitiros": ((255, 180, 40), "M"),   # dispara 3 tiros em leque
+    "perfurante": ((60, 220, 220), "F"),   # o tiro atravessa os vagões
+    "missil": ((200, 80, 220), "X"),       # explode em área
 }
+WEAPON_NAMES = {"multitiros": "MULTITIROS", "perfurante": "PERFURANTE", "missil": "MÍSSIL"}
+# Onda em que cada bônus passa a poder cair (os demais caem desde a onda 1)
+POWERUP_MIN_WAVE = {"multitiros": 2, "perfurante": 3, "missil": 4}
 
 # Configurações por dificuldade
 # speed_mul / hp_mul: multiplicadores de velocidade e vida dos vagões
@@ -175,7 +185,7 @@ def load_save():
             loaded = json.load(f)
         if isinstance(loaded, dict):
             data.update(loaded)
-    except (OSError, json.JSONDecodeError, TypeError):
+    except (OSError, ValueError, TypeError):   # ValueError cobre JSON inválido e UnicodeDecodeError
         # Arquivo inexistente ou corrompido — tenta migrar o recorde antigo
         old = _migrate_old_record()
         if old > 0:
@@ -184,10 +194,12 @@ def load_save():
 
 
 def write_save(data):
-    """Grava o dicionário de save em disco (JSON formatado)."""
+    """Grava o save de forma atômica: escreve num temporário e troca (não corrompe se travar)."""
+    tmp = SAVE_FILE + ".tmp"
     try:
-        with open(SAVE_FILE, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, SAVE_FILE)
     except OSError:
         pass
 
@@ -323,6 +335,62 @@ PAD = 30
 _sprites = {}
 
 
+class Track:
+    """
+    Pista fechada em volta da torre; a forma muda a cada onda.
+
+    O raio varia com o ângulo: rho = 1 + a*cos(k*ang + fase), com estiramento horizontal.
+    O trem gira no sentido horário, do túnel de entrada ao de saída.
+    """
+
+    def __init__(self, a, k, phase, stretch):
+        ry = TRACK_R / (1 + a)
+        rx = ry * stretch
+        n = 720
+        self.pts = []
+        for i in range(n + 1):
+            th = IN_ANG + (OUT_ANG - IN_ANG) * i / n
+            rho = 1 + a * math.cos(k * th + phase)
+            self.pts.append((CX + rx * rho * math.cos(th), CY + ry * rho * math.sin(th)))
+        self.cum = [0.0]                       # distância acumulada até cada ponto
+        for (x0, y0), (x1, y1) in zip(self.pts, self.pts[1:]):
+            self.cum.append(self.cum[-1] + math.hypot(x1 - x0, y1 - y0))
+        self.length = self.cum[-1]
+
+    def point(self, s, radial=0.0):
+        last = len(self.pts) - 2
+        if s <= 0:                             # antes do túnel de entrada: prolonga o primeiro trecho
+            i = 0
+        elif s >= self.length:                 # dentro do túnel de saída: prolonga o último
+            i = last
+        else:
+            i = min(bisect.bisect_right(self.cum, s) - 1, last)
+        d = s - self.cum[i]
+        (x0, y0), (x1, y1) = self.pts[i], self.pts[i + 1]
+        seg = self.cum[i + 1] - self.cum[i]
+        tx, ty = (x1 - x0) / seg, (y1 - y0) / seg
+        nx, ny = ty, -tx                       # normal para fora da pista
+        return (x0 + tx * d + nx * radial, y0 + ty * d + ny * radial,
+                math.atan2(ty, tx) - math.pi / 2)
+
+
+_track = Track(0, 2, 0.0, 1.0)     # onda 1: círculo
+TRACK_LEN = _track.length          # comprimento da pista atual (atualizado por set_track)
+
+
+def set_track(wave):
+    """Gera a pista da onda: a partir da onda 2 ela ganha curvas e fica mais esticada."""
+    global _track, TRACK_LEN
+    if wave <= 1:
+        _track = Track(0, 2, 0.0, 1.0)
+    else:
+        a = min(0.05 * (wave - 1), 0.22) * random.uniform(0.6, 1.0)
+        k = random.choice([2, 3, 4] if wave < 6 else [2, 3, 4, 5])
+        stretch = 1 + random.uniform(0.1, 0.2) * min(wave - 1, 3)
+        _track = Track(a, k, random.uniform(0, math.tau), stretch)
+    TRACK_LEN = _track.length
+
+
 def track_point(s, radial=0.0):
     """
     Converte distância percorrida na pista (s) em coordenadas de tela.
@@ -332,9 +400,7 @@ def track_point(s, radial=0.0):
 
     Retorna (x, y, ângulo) em radianos.
     """
-    ang = IN_ANG + s / TRACK_R
-    r = TRACK_R + radial
-    return CX + math.cos(ang) * r, CY + math.sin(ang) * r, ang
+    return _track.point(s, radial)
 
 
 def car_sprite(kind, flash):
@@ -675,10 +741,10 @@ class Quadtree:
 class Car:
     """Representa um vagão (ou locomotiva/chefe) do trem."""
 
-    def __init__(self, kind, s, hp_mul=1.0, speed_bonus=0.0):
+    def __init__(self, kind, s, hp_mul=1.0, speed_bonus=0.0, hp_bonus=0):
         self.kind = kind
         base_hp, self.points, self.w, self.h, self.color, _ = CAR_TYPES[kind]
-        self.hp = max(1, int(base_hp * hp_mul))   # vida atual (já com multiplicador de dificuldade)
+        self.hp = max(1, int(base_hp * hp_mul)) + hp_bonus   # vida atual (dificuldade + bônus por onda)
         self.max_hp = self.hp
         self.s = s                                 # posição ao longo da pista (centro do vagão)
         self.flash = 0.0                           # tempo restante de flash branco (dano)
@@ -750,7 +816,7 @@ class Car:
 class Bullet:
     """Projétil disparado pela torre (ou por um vagão atirador)."""
 
-    def __init__(self, x, y, angle, damage, enemy=False):
+    def __init__(self, x, y, angle, damage, enemy=False, pierce=False, blast=False):
         self.x, self.y = x, y
         speed = 420 if enemy else 750          # tiros inimigos são mais lentos
         self.vx = math.cos(angle) * speed
@@ -759,6 +825,9 @@ class Bullet:
         self.alive = True
         self.enemy = enemy                     # True = tiro do inimigo
         self.trail = []                        # posições recentes para desenhar rastro
+        self.pierce = pierce                   # atravessa os vagões
+        self.blast = blast                     # explode em área ao acertar
+        self.hit = set()                       # vagões já atingidos (perfurante não repete dano)
 
     def update(self, dt):
         """Avança a posição e atualiza o rastro. Marca como morto se sair da tela."""
@@ -780,6 +849,10 @@ class Bullet:
         if self.enemy:
             color = (255, 80, 255)
             r = 5
+        elif self.pierce:
+            color, r = (60, 220, 220), 4
+        elif self.blast:
+            color, r = (200, 80, 220), 7
         else:
             color = (255, 90, 60) if self.damage > 1 else (255, 230, 100)
             r = 6 if self.damage > 1 else 4
@@ -982,15 +1055,25 @@ class Game:
         Atualiza recordes e estatísticas no save.
         """
         self.state = state
-        # Grava estatísticas desta partida
+        self._record_game()
+
+    def _record_game(self):
+        """Grava a partida no save (no máximo uma vez), inclusive se ela for abandonada."""
+        if getattr(self, "_recorded", True):
+            return
+        self._recorded = True
         self.save_mgr.end_game(
             score=self.score,
             wave=self.wave,
             cars_destroyed=self.cars_destroyed_session,
             reached_endless=self.endless,
         )
-        # Atualiza o recorde exibido no HUD
-        self.record = self.save_mgr.high_score
+        self.record = self.save_mgr.high_score   # atualiza o recorde exibido
+
+    def go_menu(self):
+        """Volta ao menu (permite trocar dificuldade e nome). A partida atual é gravada."""
+        self._record_game()
+        self.state = "menu"
 
     def reset(self, from_menu=True):
         """
@@ -1000,13 +1083,14 @@ class Game:
         from_menu=False → só prepara o estado (usado no __init__).
         """
         if from_menu:
+            self._record_game()   # se a partida anterior foi abandonada (R no meio), grava antes
             self.save_mgr.begin_game(self.difficulty)
 
         diff = DIFFICULTIES[self.difficulty]
         self.wave = 0
         self.score = 0
         self.lives = diff["lives"]
-        self.max_lives = diff["lives"]
+        self.max_lives = MAX_LIVES
         self.state = "playing"
         self.aim = -math.pi / 2          # mira inicial apontando para cima
         self.bullets = []
@@ -1018,6 +1102,9 @@ class Game:
         self.rapid = 0.0                 # tempo restante de power-up rapidez
         self.heavy = 0.0                 # tempo restante de power-up pesado
         self.multi = 0.0                 # tempo restante de multitiros
+        self.weapon = None               # arma temporária: "perfurante" ou "missil"
+        self.weapon_t = 0.0
+        self.banner_notes = []           # linhas exibidas no banner da onda
         self.combo = 0
         self.combo_t = 0.0
         self.shake = 0.0                 # intensidade do tremor de tela
@@ -1028,46 +1115,43 @@ class Game:
         self.endless = False             # True depois de completar as 5 ondas normais
         self.cars_destroyed_session = 0  # contador de vagões destruídos nesta partida
         self._quadtree = None            # reconstruída a cada frame em update()
+        self._recorded = not from_menu   # só partidas iniciadas pelo menu contam no save
         self.next_wave()
 
     def next_wave(self):
-        """Prepara a próxima onda de vagões (ou entra no Endless)."""
+        """Prepara a próxima onda: trem maior, mais rápido, mais resistente e em nova pista."""
         self.wave += 1
+        w = self.wave
         diff = DIFFICULTIES[self.difficulty]
-
-        # Quantidade de vagões cresce com a onda
-        base_n = 7 + 3 * (self.wave - 1)
-        if self.wave > TOTAL_WAVES:
+        if w > TOTAL_WAVES:
             self.endless = True
-            n = 10 + 2 * (self.wave - TOTAL_WAVES)
-        else:
-            n = base_n
+
+        n = 7 + 3 * (w - 1)                      # a composição sempre cresce
 
         # Tipos disponíveis aumentam conforme a onda avança
         kinds = ["carga", "tanque", "passageiro"]
-        if self.wave >= 2:
+        if w >= 2:
             kinds += ["blindado", "rapido"]
-        if self.wave >= 3:
+        if w >= 3:
             kinds += ["blindado", "tanque", "bomba"]
-        if self.wave >= 4:
+        if w >= 4:
             kinds += ["atirador", "rapido", "bomba"]
-        if self.wave >= 6:
+        if w >= 6:
             kinds += ["atirador", "blindado", "bomba"]
 
-        # Velocidade base da onda (limitada para não ficar impossível)
-        speed_base = (38 + 11 * min(self.wave, 12)) * diff["speed_mul"]
-        self.speed = speed_base
+        self.speed = (38 + 11 * min(w, 16)) * diff["speed_mul"]
+        hp_bonus = (w - 1) // 4                  # vagões ganham vida com o tempo
+        set_track(w)                             # cada onda tem um trajeto novo
 
         # Monta o trem: locomotiva na frente + vagões aleatórios
-        self.cars = [Car("locomotiva", 0, diff["hp_mul"])]
+        self.cars = [Car("locomotiva", 0, diff["hp_mul"], hp_bonus=hp_bonus)]
         for _ in range(n - 1):
-            k = random.choice(kinds)
-            bonus = 0.35 if k == "rapido" else 0.0   # vagões rápidos andam 35% mais rápido
-            self.cars.append(Car(k, 0, diff["hp_mul"], bonus))
+            self.cars.append(Car(random.choice(kinds), 0, diff["hp_mul"], hp_bonus=hp_bonus))
 
-        # Chefe na onda 5 (e a cada 5 ondas no Endless)
-        if self.wave == TOTAL_WAVES or (self.endless and self.wave % 5 == 0):
-            self.cars[1] = Car("chefe", 0, diff["hp_mul"])
+        # Chefes logo atrás da locomotiva: 1 na onda 5, 2 na 10, 3 a partir da 15
+        bosses = min(w // BOSS_EVERY, 3) if w % BOSS_EVERY == 0 else 0
+        for i in range(bosses):
+            self.cars[1 + i] = Car("chefe", 0, diff["hp_mul"], hp_bonus=5 * (w // BOSS_EVERY - 1))
 
         # Posiciona os vagões enfileirados dentro do túnel de entrada
         pos = 0.0
@@ -1075,9 +1159,20 @@ class Game:
             c.s = pos - c.w / 2
             pos -= c.w + CAR_SPACING
 
+        notes = []
+        if w >= 2:
+            notes.append(("NOVO TRAJETO!", (255, 220, 100)))
+        for kind, first in POWERUP_MIN_WAVE.items():
+            if first == w:
+                notes.append((f"Novo bônus: {WEAPON_NAMES[kind]} ({POWERUPS[kind][1]})", POWERUPS[kind][0]))
+        if bosses:
+            notes.append(("CHEFE À VISTA!" if bosses == 1 else f"{bosses} CHEFES À VISTA!", (255, 100, 120)))
+        notes.append((f"{n} vagões", (220, 220, 220)))
+        self.banner_notes = notes
+
         self.bullets.clear()
         self.enemy_bullets.clear()
-        self.banner_t = 2.0          # mostra o banner da onda por 2 segundos
+        self.banner_t = 2.5          # mostra o banner da onda por 2,5 segundos
         self.state = "banner"
 
     @property
@@ -1091,12 +1186,10 @@ class Game:
             return
         mx, my = self.muzzle
         dmg = 2 if self.heavy > 0 else 1
-        if self.multi > 0:
-            # Três tiros em leque
-            for offset in (-0.18, 0.0, 0.18):
-                self.bullets.append(Bullet(mx, my, self.aim + offset, dmg))
-        else:
-            self.bullets.append(Bullet(mx, my, self.aim, dmg))
+        offsets = (-0.18, 0.0, 0.18) if self.multi > 0 else (0.0,)   # multitiros = leque de 3
+        for off in offsets:
+            self.bullets.append(Bullet(mx, my, self.aim + off, dmg,
+                                       pierce=self.weapon == "perfurante", blast=self.weapon == "missil"))
         self.cooldown = FIRE_DELAY_RAPID if self.rapid > 0 else FIRE_DELAY
         self.play("shot")
 
@@ -1157,6 +1250,10 @@ class Game:
         self.rapid = max(0.0, self.rapid - dt)
         self.heavy = max(0.0, self.heavy - dt)
         self.multi = max(0.0, self.multi - dt)
+        if self.weapon:
+            self.weapon_t -= dt
+            if self.weapon_t <= 0:
+                self.weapon = None
         self.shake = max(0.0, self.shake - dt)
         if self.combo_t > 0:
             self.combo_t -= dt
@@ -1165,8 +1262,7 @@ class Game:
 
         # --- movimento dos vagões ---
         for c in self.cars:
-            spd = self.speed * (1.0 + c.speed_bonus)
-            c.s += spd * dt
+            c.s += self.speed * dt
             c.flash = max(0.0, c.flash - dt)
 
             # Atiradores disparam periodicamente na torre
@@ -1203,21 +1299,18 @@ class Game:
             if not b.alive:
                 continue
             # Consulta espacial: só candidatos próximos ao tiro
-            candidates = qt.query_point(b.x, b.y, radius=20)
-            hit = False
-            for c in candidates:
-                if c.hp > 0 and c.hit_test(b.x, b.y):
+            for c in qt.query_point(b.x, b.y, radius=20):
+                if c.hp <= 0 or id(c) in b.hit or not c.hit_test(b.x, b.y):
+                    continue
+                b.hit.add(id(c))
+                self.hurt(c, b.damage, b.x, b.y)
+                if b.blast:
+                    self._blast(b, c, qt)
+                if not b.pierce:          # o tiro perfurante segue em frente
                     b.alive = False
-                    c.hp -= b.damage
-                    c.flash = 0.09
-                    self.explode(b.x, b.y, c.color, False)
-                    self.play("hit")
-                    if c.hp <= 0:
-                        self._destroy_car(c)
-                    hit = True
                     break
-            if not hit:
-                # Se não acertou vagão, tenta acertar um power-up (coleta)
+            if b.alive:
+                # Se o tiro continua vivo, tenta acertar um power-up (coleta)
                 for pu in self.powerups[:]:
                     if b.rect.colliderect(pu.rect):
                         b.alive = False
@@ -1276,6 +1369,30 @@ class Game:
             self.play("wave")
             self.next_wave()
 
+    def hurt(self, c, dmg, x, y):
+        """Aplica dano a um vagão (com feedback visual/sonoro) e o destrói se a vida acabar."""
+        c.hp -= dmg
+        c.flash = 0.09
+        self.explode(x, y, c.color, False)
+        self.play("hit")
+        if c.hp <= 0:
+            self._destroy_car(c)
+
+    def _blast(self, b, hit_car, qt):
+        """Explosão do míssil: causa o mesmo dano aos vagões num raio de BLAST_R."""
+        self.explode(b.x, b.y, (255, 150, 40), True)
+        self.shake = max(self.shake, 0.15)
+        for o in qt.query_circle(b.x, b.y, BLAST_R):
+            if o is hit_car or o.hp <= 0:
+                continue
+            ox, oy = o.pos
+            if math.hypot(ox - b.x, oy - b.y) < BLAST_R:
+                self.hurt(o, b.damage, ox, oy)
+
+    def powerup_pool(self):
+        """Bônus que já podem cair na onda atual."""
+        return [k for k in POWERUPS if POWERUP_MIN_WAVE.get(k, 1) <= self.wave]
+
     def _destroy_car(self, c):
         """
         Processa a destruição de um vagão:
@@ -1298,6 +1415,9 @@ class Game:
             self.shake = 0.4
             self.flash_t = 0.18
         self.explode(cx, cy, c.color, big)
+        if c.kind == "chefe":                       # recompensa por derrubar um chefe
+            self.lives = min(self.lives + 1, self.max_lives)
+            self.add_float(cx, cy - 45, "+1 VIDA", (255, 120, 140))
 
         # Efeito em cadeia da bomba — vizinhos via quadtree (raio 90 px)
         if c.kind == "bomba":
@@ -1318,7 +1438,7 @@ class Game:
         # Drop de power-up
         chance = DIFFICULTIES[self.difficulty]["power_chance"]
         if c.kind == "chefe" or random.random() < chance:
-            kind = random.choice(list(POWERUPS.keys()))
+            kind = random.choice(self.powerup_pool())
             self.powerups.append(PowerUp(kind, cx, cy))
 
     @property
@@ -1343,6 +1463,9 @@ class Game:
             self.heavy = HEAVY_TIME
         elif pu.kind == "multitiros":
             self.multi = 4.0
+        elif pu.kind in ("perfurante", "missil"):
+            self.weapon = pu.kind
+            self.weapon_t = WEAPON_TIME
         else:   # escudo
             self.shields += 1
 
@@ -1393,15 +1516,12 @@ class Game:
             self.overlay_menu(surf)
         elif self.state == "paused":
             self.overlay(surf, "PAUSADO", (255, 255, 255),
-                         "P continua  |  R reinicia  |  ESC sai")
+                         "P continua  |  R reinicia  |  M menu  |  ESC sai")
         elif self.state == "banner":
             label = f"ONDA {self.wave}" if not self.endless else f"ENDLESS {self.wave}"
-            self.center_text(surf, label, (255, 255, 255), -30)
-            if any(c.kind == "chefe" for c in self.cars):
-                self.center_text(surf, "CHEFE À VISTA!", (255, 100, 120), 50, small=True)
-            self.center_text(surf, f"{len(self.cars)} vagões", (220, 220, 220), 20, small=True)
-        elif self.state == "won":
-            self.overlay(surf, "VITÓRIA!", (120, 255, 140))
+            self.center_text(surf, label, (255, 255, 255), -50)
+            for i, (txt, col) in enumerate(self.banner_notes):
+                self.center_text(surf, txt, col, 10 + i * 28, small=True)
         elif self.state == "lost":
             self.overlay(surf, "O TREM PASSOU!", (255, 100, 100))
 
@@ -1464,12 +1584,12 @@ class Game:
 
     def draw_hud(self, surf):
         """Desenha a barra superior com pontuação, onda, vidas e power-ups ativos."""
-        pygame.draw.rect(surf, (18, 22, 32), (0, 0, W, 36))
+        pygame.draw.rect(surf, (18, 22, 32), (0, 0, W, 40))
 
-        # Nome do jogador + pontos e recorde
+        # Pontos (linha 1) e nome + recorde (linha 2, fonte menor para não invadir o centro)
         pname = self.save_mgr.player_name or "Anônimo"
-        surf.blit(self.font.render(f"{pname}  |  Pontos: {self.score}", True, (255, 255, 255)), (12, 7))
-        surf.blit(self.small.render(f"Recorde: {self.record}", True, (180, 180, 200)), (12, 22))
+        surf.blit(self.font.render(f"Pontos: {self.score}", True, (255, 255, 255)), (12, 1))
+        surf.blit(self.small.render(f"{pname}  |  Recorde: {self.record}", True, (180, 180, 200)), (12, 21))
 
         # Número da onda
         wave_label = f"Endless {self.wave}" if self.endless else f"Onda {self.wave}/{TOTAL_WAVES}"
@@ -1482,26 +1602,30 @@ class Game:
             pygame.draw.circle(surf, col, (W - 28 - i * 28, 18), 9)
             pygame.draw.circle(surf, (30, 20, 20), (W - 28 - i * 28, 18), 9, 1)
 
-        # Indicadores de power-ups ativos
-        x = 280
-        for label, t, col in (
+        # Combo (topo, à esquerda do número da onda)
+        if self.multiplier > 1:
+            img = self.font.render(f"COMBO x{self.multiplier}", True, (255, 220, 80))
+            surf.blit(img, (W // 2 - img.get_width() // 2 - 110, 8))
+
+        # Indicadores de bônus ativos (canto inferior esquerdo, longe da barra do topo)
+        active = [
             ("RAPIDEZ", self.rapid, POWERUPS["rapidez"][0]),
             ("PESADO", self.heavy, POWERUPS["pesado"][0]),
             ("MULTI", self.multi, POWERUPS["multitiros"][0]),
-        ):
+        ]
+        if self.weapon:
+            active.append((WEAPON_NAMES[self.weapon], self.weapon_t, POWERUPS[self.weapon][0]))
+        if self.shields or any(t > 0 for _, t, _ in active):
+            strip = pygame.Surface((W, 30), pygame.SRCALPHA)
+            strip.fill((10, 14, 22, 170))            # faixa escura para o texto colorido ficar legível
+            surf.blit(strip, (0, H - 30))
+        x = 12
+        for label, t, col in active:
             if t > 0:
-                surf.blit(self.small.render(f"{label} {t:.1f}s", True, col), (x, 10))
-                x += 105
-
-        # Combo
-        if self.multiplier > 1:
-            col = (255, 220, 80)
-            img = self.font.render(f"COMBO x{self.multiplier}", True, col)
-            surf.blit(img, (W // 2 - img.get_width() // 2 - 90, 7))
-
-        # Escudos
+                surf.blit(self.small.render(f"{label} {t:.1f}s", True, col), (x, H - 26))
+                x += 135
         if self.shields:
-            surf.blit(self.small.render(f"ESCUDO x{self.shields}", True, POWERUPS["escudo"][0]), (x, 10))
+            surf.blit(self.small.render(f"ESCUDO x{self.shields}", True, POWERUPS["escudo"][0]), (x, H - 26))
 
     def center_text(self, surf, text, color, dy, small=False):
         """Desenha texto centralizado horizontalmente, com deslocamento vertical dy."""
@@ -1581,7 +1705,7 @@ class Game:
         else:
             lines = [
                 "Mouse: mira  |  Clique: atira  |  P: pausa",
-                "Power-ups: R rapidez · P pesado · E escudo · M multitiros",
+                "Bônus: R rapidez · P pesado · E escudo · M multitiros · F perfurante · X míssil",
             ]
             for i, line in enumerate(lines):
                 self.center_text(surf, line, (190, 190, 200), 90 + i * 22, small=True)
@@ -1589,7 +1713,7 @@ class Game:
         self.center_text(surf, "Clique ou ENTER para começar  |  N editar nome",
                          (100, 255, 130), 220, small=True)
 
-    def overlay(self, surf, title, color, hint="R joga de novo  |  ESC sai"):
+    def overlay(self, surf, title, color, hint="R joga de novo  |  M menu  |  ESC sai"):
         """Overlay genérico de fim de jogo ou pausa."""
         shade = pygame.Surface((W, H), pygame.SRCALPHA)
         shade.fill((0, 0, 0, 160))
@@ -1612,6 +1736,13 @@ class Game:
 # ===========================================================================
 # Loop principal
 # ===========================================================================
+
+def quit_game(game):
+    """Sai do jogo gravando a partida em andamento (o recorde não se perde ao fechar a janela)."""
+    game._record_game()
+    pygame.quit()
+    sys.exit()
+
 
 def main():
     """Inicializa o Pygame e roda o loop principal do jogo."""
@@ -1637,8 +1768,7 @@ def main():
         # --- eventos de entrada ---
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
-                pygame.quit()
-                sys.exit()
+                quit_game(game)
 
             # Tela de registro de nome — trata teclas e texto separadamente
             if game.state == "name_entry":
@@ -1662,14 +1792,15 @@ def main():
                 continue
 
             if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
-                pygame.quit()
-                sys.exit()
+                quit_game(game)
 
             if ev.type == pygame.KEYDOWN:
                 if ev.key == pygame.K_r and game.state != "menu":
                     game.reset()
                 if ev.key == pygame.K_p:
                     game.toggle_pause()
+                if ev.key == pygame.K_m and game.state in ("paused", "lost"):
+                    game.go_menu()
                 # Menu: dificuldade, nome e começar
                 if game.state == "menu":
                     if ev.key in (pygame.K_1, pygame.K_KP1):
