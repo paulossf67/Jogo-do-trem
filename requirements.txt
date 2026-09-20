@@ -1,1 +1,2 @@
-pygame-ce>=2.5.0
+# Requer Python 3.13 (o Arcade 3.x depende do pymunk 6.9, que ainda não tem pacote para 3.14)
+arcade>=3.3,<4

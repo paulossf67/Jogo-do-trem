@@ -7,7 +7,7 @@ Controles:
   P .............. pausa
   R .............. reinicia
   M .............. volta ao menu (na pausa ou no fim da partida)
-  1/2/3 .......... escolha de dificuldade no menu
+  1/2/3 .......... escolha de dificuldade no menu / de melhoria entre ondas
   ESC ............ sai
 
 Requer Python 3.13 e a biblioteca Arcade 3.x (veja requirements.txt).
@@ -64,6 +64,20 @@ POWERUP_SPEED = 70         # velocidade com que o power-up voa até a torre (px/
 COMBO_WINDOW = 2.2         # tempo máximo entre destruições para manter o combo
 WEAPON_TIME = 8.0          # duração das armas perfurante e míssil
 BLAST_R = 85               # raio da explosão do míssil (px)
+AURA_R = 110               # alcance da habilidade do médico e do protetor (px)
+
+# Melhorias escolhidas entre as ondas: nome -> (título, descrição, nível máximo)
+UPGRADES = {
+    "cadencia": ("Cadência", "Tiros 12% mais rápidos", 5),
+    "dano": ("Munição pesada", "+1 de dano em todos os tiros", 2),
+    "vida": ("Blindagem", "+1 vida máxima e recupera 1", 3),
+    "escudo": ("Escudo reserva", "Ganha 1 escudo agora", 99),
+    "duracao": ("Bônus longos", "Power-ups duram 25% mais", 3),
+    "sorte": ("Sorte", "+6% de chance de bônus", 4),
+}
+UPGRADE_SHORT = {"cadencia": "CAD", "dano": "DANO", "vida": "VIDA", "escudo": "ESC", "duracao": "DUR", "sorte": "SORTE"}
+UPGRADE_MAX_LIVES = 8      # teto de vidas com a melhoria "Blindagem"
+SHOP_CARD_W, SHOP_CARD_H, SHOP_GAP, SHOP_TOP = 270, 190, 30, 230   # layout das cartas de melhoria
 
 # tipo: (vida, pontos, largura, altura, cor RGB, nome exibido)
 CAR_TYPES = {
@@ -76,6 +90,13 @@ CAR_TYPES = {
     "bomba": (2, 30, 64, 48, (180, 50, 20), "Bomba"),         # explode e danifica vizinhos
     "atirador": (2, 35, 68, 44, (160, 60, 200), "Atirador"),  # atira de volta na torre
     "chefe": (18, 400, 140, 68, (90, 30, 120), "Chefe"),       # boss da onda
+    "medico": (2, 40, 66, 44, (235, 235, 240), "Médico"),      # cura os vizinhos feridos
+    "protetor": (3, 45, 66, 44, (80, 90, 210), "Protetor"),    # dá barreira (absorve 1 dano) aos vizinhos
+}
+# Onda em que cada vagão de apoio aparece e o texto do aviso
+NEW_CAR_INFO = {
+    "medico": (4, "MÉDICO — cura os vizinhos"),
+    "protetor": (6, "PROTETOR — barreira nos vizinhos"),
 }
 CAR_SPACING = 12  # espaço entre vagões na formação do trem
 
@@ -509,6 +530,12 @@ def car_texture(kind, flash):
                     (255, 210, 40))
         cv.circle(cx, y0 + 18, 10, (255, 60, 60))                         # olho
         cv.circle(cx, y0 + 18, 4, (20, 0, 0))
+    elif kind == "medico":
+        cv.rect((cx - 15, cy - 4, cx + 15, cy + 4), (220, 40, 40))        # cruz vermelha
+        cv.rect((cx - 4, cy - 15, cx + 4, cy + 15), (220, 40, 40))
+    elif kind == "protetor":
+        cv.circle(cx, cy, 15, (170, 200, 255), (30, 30, 30), 2)           # domo do gerador de barreira
+        cv.circle(cx, cy, 6, (60, 70, 170))
     elif kind == "carga":
         cv.line((cx, y0), (cx, y1), (150, 85, 20), 3)
 
@@ -709,6 +736,8 @@ class Car:
         self.shoot_cd = random.uniform(1.5, 3.0) if kind == "atirador" else 0.0   # só para "atirador"
         self._bounds = (0.0, 0.0, 0.0, 0.0)        # AABB para a quadtree (refresh_bounds)
         self._flash_shown = False
+        self.ability_cd = random.uniform(1.0, 3.0)   # recarga da habilidade (médico cura, protetor cria barreira)
+        self.barrier = False                          # barreira do protetor: absorve o próximo dano
         self.sprite = arcade.Sprite(car_texture(kind, False))
 
     def _center(self):
@@ -1041,6 +1070,8 @@ class Game:
         self.heavy = 0.0                 # tempo restante de power-up pesado
         self.multi = 0.0                 # tempo restante de multitiros
         self.weapon = None               # arma temporária: "perfurante" ou "missil"
+        self.upgrades = {}               # melhorias escolhidas entre ondas: nome -> nível
+        self.shop_choices = []           # cartas oferecidas na tela de melhorias
         self.weapon_t = 0.0
         self.banner_notes = []           # linhas exibidas no banner da onda
         self.combo = 0
@@ -1077,6 +1108,10 @@ class Game:
             kinds += ["atirador", "rapido", "bomba"]
         if w >= 6:
             kinds += ["atirador", "blindado", "bomba"]
+        if w >= NEW_CAR_INFO["medico"][0]:
+            kinds += ["medico"]
+        if w >= NEW_CAR_INFO["protetor"][0]:
+            kinds += ["protetor", "medico"]
 
         self.speed = (38 + 11 * min(w, 16)) * diff["speed_mul"]
         hp_bonus = (w - 1) // 4                  # vagões ganham vida com o tempo
@@ -1113,6 +1148,9 @@ class Game:
         for kind, first in POWERUP_MIN_WAVE.items():
             if first == w:
                 notes.append((f"Novo bônus: {WEAPON_NAMES[kind]} ({POWERUPS[kind][1]})", POWERUPS[kind][0]))
+        for info_wave, text in NEW_CAR_INFO.values():
+            if info_wave == w:
+                notes.append((f"Novo vagão: {text}", (255, 255, 255)))
         if bosses:
             notes.append(("CHEFE À VISTA!" if bosses == 1 else f"{bosses} CHEFES À VISTA!", (255, 100, 120)))
         notes.append((f"{n} vagões", (220, 220, 220)))
@@ -1134,12 +1172,13 @@ class Game:
         if self.state != "playing" or self.cooldown > 0:
             return
         mx, my = self.muzzle
-        dmg = 2 if self.heavy > 0 else 1
+        dmg = (2 if self.heavy > 0 else 1) + self.upgrade_level("dano")
         offsets = (-0.18, 0.0, 0.18) if self.multi > 0 else (0.0,)   # multitiros = leque de 3
         for off in offsets:
             self.bullets.append(Bullet(mx, my, self.aim + off, dmg,
                                        pierce=self.weapon == "perfurante", blast=self.weapon == "missil"))
-        self.cooldown = FIRE_DELAY_RAPID if self.rapid > 0 else FIRE_DELAY
+        base = FIRE_DELAY_RAPID if self.rapid > 0 else FIRE_DELAY
+        self.cooldown = base * 0.88 ** self.upgrade_level("cadencia")
         self.play("shot")
 
     def explode(self, x, y, color, big=False, smoke=False):
@@ -1228,6 +1267,12 @@ class Game:
                     ang = math.atan2(CY - cy, CX - cx)
                     self.enemy_bullets.append(Bullet(cx, cy, ang, 1, enemy=True))
                     self.play("enemy_shot")
+
+            # Médico e protetor usam a habilidade de tempos em tempos
+            if c.kind in ("medico", "protetor") and c.on_track:
+                c.ability_cd -= dt
+                if c.ability_cd <= 0:
+                    self._use_ability(c)
 
         # --- atualiza projéteis e power-ups ---
         for b in self.bullets:
@@ -1318,10 +1363,75 @@ class Game:
             self.score += bonus
             self.add_float(CX, CY - 80, f"+{bonus} ONDA!", (120, 255, 160))
             self.play("wave")
-            self.next_wave()
+            self.open_shop()
             return
 
         self.sync_sprites()
+
+    def _use_ability(self, c):
+        """Médico cura 1 HP dos vizinhos feridos; protetor dá barreira aos vizinhos que ainda não têm."""
+        cx, cy = c.pos
+        helped = 0
+        for o in self.cars:
+            if o is c or o.hp <= 0 or not o.on_track:
+                continue
+            ox, oy = o.pos
+            if math.hypot(ox - cx, oy - cy) > AURA_R:
+                continue
+            if c.kind == "medico" and o.hp < o.max_hp:
+                o.hp += 1
+                helped += 1
+                self.add_float(ox, oy - 20, "+1", (90, 255, 140))
+            elif c.kind == "protetor" and not o.barrier:
+                o.barrier = True
+                helped += 1
+        if helped:
+            self.explode(cx, cy, (90, 255, 140) if c.kind == "medico" else (120, 220, 255), False)
+        # sem ninguém para ajudar, tenta de novo logo
+        c.ability_cd = (3.0 if c.kind == "medico" else 5.0) if helped else 1.0
+
+    # ---------------------------------------------------------------- melhorias entre ondas
+    def upgrade_level(self, name):
+        return self.upgrades.get(name, 0)
+
+    def open_shop(self):
+        """Abre a escolha de melhoria: 3 cartas sorteadas entre as que ainda não chegaram ao nível máximo."""
+        avail = [k for k, (_, _, top) in UPGRADES.items()
+                 if self.upgrade_level(k) < top and not (k == "vida" and self.max_lives >= UPGRADE_MAX_LIVES)]
+        self.shop_choices = random.sample(avail, min(3, len(avail)))
+        self.bullets.clear()
+        self.enemy_bullets.clear()
+        self.state = "shop"
+
+    def choose_upgrade(self, i):
+        """Aplica a melhoria da carta i e começa a próxima onda."""
+        if self.state != "shop" or not 0 <= i < len(self.shop_choices):
+            return
+        name = self.shop_choices[i]
+        self.upgrades[name] = self.upgrade_level(name) + 1
+        if name == "vida":
+            self.max_lives = min(self.max_lives + 1, UPGRADE_MAX_LIVES)
+            self.lives = min(self.lives + 1, self.max_lives)
+        elif name == "escudo":
+            self.shields += 1
+        self.add_float(CX, CY - 80, UPGRADES[name][0].upper(), (255, 220, 100))
+        self.play("power")
+        self.next_wave()
+
+    @staticmethod
+    def shop_card_rect(i, n):
+        """Retângulo (x, y, w, h) da carta i entre n cartas, em coordenadas do jogo."""
+        total = n * SHOP_CARD_W + (n - 1) * SHOP_GAP
+        return (W - total) / 2 + i * (SHOP_CARD_W + SHOP_GAP), SHOP_TOP, SHOP_CARD_W, SHOP_CARD_H
+
+    def click_shop(self, x, y):
+        """Clique do mouse na tela de melhorias: escolhe a carta sob o cursor."""
+        n = len(self.shop_choices)
+        for i in range(n):
+            rx, ry, rw, rh = self.shop_card_rect(i, n)
+            if rx <= x <= rx + rw and ry <= y <= ry + rh:
+                self.choose_upgrade(i)
+                return
 
     def _drop_dead_cars(self):
         """Tira da lista (e do desenho) os vagões sem vida."""
@@ -1332,6 +1442,12 @@ class Game:
 
     def hurt(self, c, dmg, x, y):
         """Aplica dano a um vagão (com feedback visual/sonoro) e o destrói se a vida acabar."""
+        if c.barrier:                           # a barreira do protetor absorve este golpe
+            c.barrier = False
+            c.flash = 0.09
+            self.explode(x, y, (120, 220, 255), False)
+            self.play("hit")
+            return
         c.hp -= dmg
         c.flash = 0.09
         self.explode(x, y, c.color, False)
@@ -1392,7 +1508,7 @@ class Game:
                             self._destroy_car(other)
 
         # Drop de power-up
-        chance = DIFFICULTIES[self.difficulty]["power_chance"]
+        chance = DIFFICULTIES[self.difficulty]["power_chance"] + 0.06 * self.upgrade_level("sorte")
         if c.kind == "chefe" or random.random() < chance:
             self.powerups.append(PowerUp(random.choice(self.powerup_pool()), cx, cy))
 
@@ -1412,15 +1528,16 @@ class Game:
         """Aplica o efeito do power-up coletado."""
         self.play("power")
         self.add_float(pu.x, pu.y - 25, pu.kind.upper(), POWERUPS[pu.kind][0])
+        longer = 1 + 0.25 * self.upgrade_level("duracao")     # melhoria "Bônus longos"
         if pu.kind == "rapidez":
-            self.rapid = RAPID_TIME
+            self.rapid = RAPID_TIME * longer
         elif pu.kind == "pesado":
-            self.heavy = HEAVY_TIME
+            self.heavy = HEAVY_TIME * longer
         elif pu.kind == "multitiros":
-            self.multi = 4.0
+            self.multi = 4.0 * longer
         elif pu.kind in ("perfurante", "missil"):
             self.weapon = pu.kind
-            self.weapon_t = WEAPON_TIME
+            self.weapon_t = WEAPON_TIME * longer
         else:   # escudo
             self.shields += 1
 
@@ -1443,6 +1560,10 @@ class Game:
         if back:
             arcade.draw_lines(back, (60, 0, 0), 4)
             arcade.draw_lines(front, (80, 230, 80), 4)
+        for c in self.cars:                  # anel azul nos vagões com barreira do protetor
+            if c.barrier and c.on_track:
+                bx, by = c.pos
+                ring(bx, by, max(c.w, c.h) / 2 + 6, (120, 220, 255), 2)
         self.tunnel_list.draw()          # túneis por cima dos vagões: eles "entram" e "saem" deles
 
         for pu in self.powerups:
@@ -1461,7 +1582,7 @@ class Game:
 
         for ft in self.float_texts:
             ft.draw()
-        if self.state in ("playing", "banner", "paused"):
+        if self.state in ("playing", "banner", "paused", "shop"):
             self.draw_tower()
 
     def draw_tower(self):
@@ -1486,7 +1607,7 @@ class Game:
     # ---------------------------------------------------------------- desenho da interface
     def draw_ui(self, mouse):
         """HUD, mira, flash de tela e telas de estado (sem tremor de câmera)."""
-        if self.state in ("playing", "banner", "paused"):
+        if self.state in ("playing", "banner", "paused", "shop"):
             self.draw_crosshair(mouse)
         self.draw_hud()
 
@@ -1497,6 +1618,8 @@ class Game:
             self.overlay_name_entry()
         elif self.state == "menu":
             self.overlay_menu()
+        elif self.state == "shop":
+            self.overlay_shop(mouse)
         elif self.state == "paused":
             self.overlay("PAUSADO", (255, 255, 255), "P continua  |  R reinicia  |  M menu  |  ESC sai")
         elif self.state == "banner":
@@ -1545,7 +1668,7 @@ class Game:
         ]
         if self.weapon:
             active.append((WEAPON_NAMES[self.weapon], self.weapon_t, POWERUPS[self.weapon][0]))
-        if self.shields or any(t > 0 for _, t, _ in active):
+        if self.shields or self.upgrades or any(t > 0 for _, t, _ in active):
             fill_rect(0, H - 30, W, 30, (10, 14, 22, 170))
         x = 12
         for label, t, col in active:
@@ -1554,11 +1677,34 @@ class Game:
                 x += 135
         if self.shields:
             draw_text(f"ESCUDO x{self.shields}", x, H - 15, POWERUPS["escudo"][0], 11)
+        if self.upgrades:                                         # resumo das melhorias, à direita
+            resumo = " · ".join(f"{UPGRADE_SHORT[k]} {v}" for k, v in self.upgrades.items())
+            draw_text(f"Melhorias: {resumo}", W - 12, H - 15, (190, 200, 220), 11, "right")
 
     def center_text(self, text, color, dy, size="small"):
         """Texto centralizado na tela, com deslocamento vertical dy."""
         pt, bold = {"big": (42, True), "med": (21, True), "small": (15, True)}[size]
         draw_text(text, W // 2, H // 2 + dy, color, pt, "center", "center", bold)
+
+    def overlay_shop(self, mouse):
+        """Tela de melhorias entre ondas: três cartas, escolha por 1/2/3 ou clique."""
+        fill_rect(0, 0, W, H, (0, 0, 0, 175))
+        self.center_text(f"ONDA {self.wave} CONCLUÍDA!", (120, 255, 160), -200, "big")
+        self.center_text("Escolha uma melhoria  (teclas 1, 2, 3 ou clique)", (230, 230, 230), -150)
+        n = len(self.shop_choices)
+        for i, name in enumerate(self.shop_choices):
+            rx, ry, rw, rh = self.shop_card_rect(i, n)
+            hover = rx <= mouse[0] <= rx + rw and ry <= mouse[1] <= ry + rh
+            fill_rect(rx, ry, rw, rh, (60, 80, 110) if hover else (40, 50, 70))
+            frame_rect(rx, ry, rw, rh, (120, 200, 255) if hover else (90, 110, 140), 3 if hover else 2)
+            title, desc, top = UPGRADES[name]
+            lvl = self.upgrade_level(name)
+            draw_text(f"[{i + 1}]", rx + 16, ry + 24, (255, 220, 100), 16, bold=True)
+            draw_text(title, rx + rw / 2, ry + 62, (255, 255, 255), 17, "center", "center", True)
+            draw_text(desc, rx + rw / 2, ry + 105, (200, 210, 225), 12, "center")
+            nivel = f"Nível {lvl} → {lvl + 1}" + (f"  (máx. {top})" if top < 99 else "")
+            draw_text(nivel, rx + rw / 2, ry + 150, (150, 255, 170), 12, "center")
+        self.center_text(f"Próxima: onda {self.wave + 1}", (170, 170, 190), 190)
 
     def overlay_name_entry(self):
         """Tela para registrar ou editar o nome do jogador."""
@@ -1682,6 +1828,8 @@ class TrainWindow(arcade.Window):
         self.mouse_down = True
         if self.game.state == "menu":
             self.game.reset()
+        elif self.game.state == "shop":
+            self.game.click_shop(*self.mouse)
         elif self.game.state == "playing":
             self.game.shoot()
 
@@ -1707,6 +1855,10 @@ class TrainWindow(arcade.Window):
             g.toggle_pause()
         elif symbol == key.M and g.state in ("paused", "lost"):
             g.go_menu()
+        elif g.state == "shop":                         # entre ondas: escolhe a melhoria 1, 2 ou 3
+            for i, keys in enumerate(((key.KEY_1, key.NUM_1), (key.KEY_2, key.NUM_2), (key.KEY_3, key.NUM_3))):
+                if symbol in keys:
+                    g.choose_upgrade(i)
         elif g.state == "menu":                         # menu: dificuldade, nome e começar
             if symbol in (key.KEY_1, key.NUM_1):
                 g.set_difficulty(1)
