@@ -754,14 +754,15 @@ class Car:
             self._flash_shown = flashing
             sp.texture = car_texture(self.kind, flashing)
 
-    def draw_life_bar(self):
-        """Barra de vida acima do vagão (só se tiver mais de 1 HP)."""
-        if self.max_hp > 1 and self.on_track:
-            cx, cy = self.pos
-            bw = self.w - 8
-            bx, by = cx - bw / 2, cy - self.h / 2 - 26
-            fill_rect(bx, by, bw, 4, (60, 0, 0))
-            fill_rect(bx, by, bw * self.hp / self.max_hp, 4, (80, 230, 80))
+    def life_bar(self):
+        """Segmentos (fundo, vida) da barra acima do vagão; None se não deve aparecer (1 HP ou fora da pista)."""
+        if self.max_hp <= 1 or not self.on_track:
+            return None
+        cx, cy = self.pos
+        bw = self.w - 8
+        y = Y(cy - self.h / 2 - 24)
+        x0 = cx - bw / 2
+        return ((x0, y), (x0 + bw, y)), ((x0, y), (x0 + bw * self.hp / self.max_hp, y))
 
 
 class Bullet:
@@ -1433,8 +1434,15 @@ class Game:
 
         track_shapes().draw()
         self.car_list.draw()
+        back, front = [], []                 # barras de vida de todos os vagões em 2 chamadas de desenho
         for c in self.cars:
-            c.draw_life_bar()
+            bar = c.life_bar()
+            if bar:
+                back.extend(bar[0])
+                front.extend(bar[1])
+        if back:
+            arcade.draw_lines(back, (60, 0, 0), 4)
+            arcade.draw_lines(front, (80, 230, 80), 4)
         self.tunnel_list.draw()          # túneis por cima dos vagões: eles "entram" e "saem" deles
 
         for pu in self.powerups:
