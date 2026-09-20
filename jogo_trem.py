@@ -21,7 +21,10 @@ import json
 import math
 import os
 import random
+import sys
+import tempfile
 import time
+import traceback
 import wave
 from array import array
 from datetime import datetime
@@ -1889,8 +1892,54 @@ class TrainWindow(arcade.Window):
         super().on_close()
 
 
+def autoteste(arquivo_relatorio):
+    """
+    Verificação rápida do pacote (usada depois de gerar o executável): abre a janela oculta,
+    joga alguns segundos e confere sons e desenho. O resultado vai para um arquivo, porque o
+    executável não tem console. Usa um save temporário, sem tocar no do jogador.
+    """
+    global SAVE_FILE
+    linhas, ok = [], True
+    try:
+        SAVE_FILE = os.path.join(tempfile.gettempdir(), "jogo_trem_autoteste.json")
+        if os.path.exists(SAVE_FILE):
+            os.remove(SAVE_FILE)
+        win = TrainWindow(visible=False)
+        g = win.game
+        linhas.append(f"versão {APP_VERSION} | Python {sys.version.split()[0]} | Arcade {arcade.__version__}")
+        linhas.append(f"sons carregados: {len(g.sfx)}/7")
+        ok &= len(g.sfx) == 7
+        g.save_mgr.set_player_name("Teste")
+        g.state = "menu"
+        g.reset()
+        win.mouse_down = True
+        for i in range(300):                                   # ~5 s de jogo, com tiros
+            win.mouse = (CX + 200 * math.cos(i / 20), CY + 200 * math.sin(i / 20))
+            win.on_update(1 / 60)
+            win.on_draw()
+        img = arcade.get_image()
+        linhas.append(f"desenho ok ({img.size[0]}x{img.size[1]}), onda {g.wave}, estado {g.state}, pontos {g.score}")
+        g.state = "shop"
+        g.shop_choices = list(UPGRADES)[:3]
+        win.on_draw()
+        for est in ("menu", "paused", "lost", "name_entry"):     # todas as telas desenham
+            g.state = est
+            win.on_draw()
+        linhas.append("telas ok")
+        win.close()
+    except Exception:
+        ok = False
+        linhas.append(traceback.format_exc())
+    linhas.append("RESULTADO: " + ("OK" if ok else "FALHA"))
+    with open(arquivo_relatorio, "w", encoding="utf-8") as f:
+        f.write("\n".join(linhas) + "\n")
+    return 0 if ok else 1
+
+
 def main():
     """Cria a janela e roda o loop principal do Arcade."""
+    if len(sys.argv) >= 3 and sys.argv[1] == "--autoteste":
+        sys.exit(autoteste(sys.argv[2]))
     TrainWindow()
     arcade.run()
 

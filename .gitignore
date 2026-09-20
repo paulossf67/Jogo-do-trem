@@ -7,3 +7,9 @@ __pycache__/
 save.json
 save.json.tmp
 recorde.txt
+
+# Geração do executável/instalador (recriados por instalador\construir.ps1)
+dist/
+build/
+instalador/*.spec
+instalador/icone_previa.png
