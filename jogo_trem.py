@@ -125,9 +125,17 @@ DIFFICULTIES = {
 # ---------------------------------------------------------------------------
 # Sistema de save (JSON)
 # ---------------------------------------------------------------------------
-SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "save.json")
-# Arquivo antigo de recorde (migração automática se ainda existir)
-OLD_RECORD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recorde.txt")
+APP_NAME = "Jogo do Trem"
+APP_VERSION = "1.0.0"
+_GAME_DIR = os.path.dirname(os.path.abspath(__file__))
+# O save fica na pasta de dados do usuário (%APPDATA%): a pasta de instalação (Arquivos de Programas)
+# não aceita escrita sem privilégios de administrador.
+SAVE_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), APP_NAME)
+SAVE_FILE = os.path.join(SAVE_DIR, "save.json")
+DEFAULT_SAVE_FILE = SAVE_FILE
+# Arquivos antigos, ao lado do jogo (migração automática se ainda existirem)
+LEGACY_SAVE_FILE = os.path.join(_GAME_DIR, "save.json")
+OLD_RECORD_FILE = os.path.join(_GAME_DIR, "recorde.txt")
 
 # Estrutura padrão do save — qualquer campo ausente é preenchido com estes valores
 DEFAULT_SAVE = {
@@ -204,8 +212,11 @@ def load_save():
     - Campos faltantes são preenchidos com DEFAULT_SAVE.
     """
     data = dict(DEFAULT_SAVE)
+    path = SAVE_FILE
+    if SAVE_FILE == DEFAULT_SAVE_FILE and not os.path.exists(SAVE_FILE) and os.path.exists(LEGACY_SAVE_FILE):
+        path = LEGACY_SAVE_FILE               # primeiro uso depois da mudança: aproveita o save antigo
     try:
-        with open(SAVE_FILE, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             loaded = json.load(f)
         if isinstance(loaded, dict):
             data.update(loaded)
@@ -220,6 +231,7 @@ def write_save(data):
     """Grava o save de forma atômica: escreve num temporário e troca (não corrompe se travar)."""
     tmp = SAVE_FILE + ".tmp"
     try:
+        os.makedirs(os.path.dirname(SAVE_FILE), exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
         os.replace(tmp, SAVE_FILE)
@@ -1789,7 +1801,7 @@ class TrainWindow(arcade.Window):
     """Janela do jogo. A lógica fica em Game; aqui só entrada, câmera e ciclo de desenho."""
 
     def __init__(self, visible=True):
-        super().__init__(W, H, "Jogo do Trem — Arcade", update_rate=1 / 60, vsync=True, visible=visible)
+        super().__init__(W, H, f"{APP_NAME} {APP_VERSION}", update_rate=1 / 60, vsync=True, visible=visible)
         self.background_color = (78, 145, 70)
         self.game = Game()
         self.camera = arcade.Camera2D()                 # câmera do mundo (recebe o tremor de tela)
